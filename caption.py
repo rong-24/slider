@@ -1,172 +1,165 @@
+import argparse
 import glob
 import json
 import os
 import random
 import shutil
+from pathlib import Path
+from typing import List
 
 import torch
 from accelerate.utils import set_seed
 from PIL import Image
-from tqdm import tqdm, trange
+from tqdm import tqdm
 from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
-import argparse
 
 
-def center_crop(im: Image) -> Image:
-    # Get dimensions
+def center_crop(im: Image.Image) -> Image.Image:
     width, height = im.size
     min_dim = min(width, height)
-    left = (width - min_dim) / 2
-    top = (height - min_dim) / 2
-    right = (width + min_dim) / 2
-    bottom = (height + min_dim) / 2
-    # Crop the center of the image
-    im = im.crop((left, top, right, bottom))
-    return im
+    left = int((width - min_dim) / 2)
+    top = int((height - min_dim) / 2)
+    right = left + min_dim
+    bottom = top + min_dim
+    return im.crop((left, top, right, bottom))
 
 
-def load_im_from_path(im_path: str) -> Image:
+def load_im_from_path(im_path: str, image_resolution: int) -> Image.Image:
     image = Image.open(im_path).convert("RGB")
     image = center_crop(image)
     image = image.resize((image_resolution, image_resolution), Image.LANCZOS)
     return image
 
 
-def get_random_image(folder_path):
-    x = random.choice(folder_path)
-    while x.split("/")[-1] in [
-        "n02085936_7574.JPEG",
-        "n02105855_16006.JPEG",
-        "n02107574_133.JPEG",
-        "n02107683_1677.JPEG",
-        "n02107683_5973.JPEG",
-        "n02108915_5290.JPEG",
-        "n02105641_6159.JPEG",
-        "n02123159_630.JPEG",
-        "n02124075_7446.JPEG",
-        "n02108915_2468.JPEG",
-        "n02085936_8369.JPEG",
-        "n02108915_2789.JPEG",
-        "n02124075_2958.JPEG",
-        "n02105855_10368.JPEG",
-        "n02123394_2784.JPEG",
-        "n02107683_3886.JPEG",
-        "n02123394_6318.JPEG",
-        "n02105855_13529.JPEG",
-        "n02124075_4399.JPEG",
-        "n02123597_6444.JPEG",
-        "n02123597_2370.JPEG",
-        "n02124075_7914.JPEG",
-        "n02105855_10167.JPEG",
-        "n02123597_1843.JPEG",
-        "n02105855_13211.JPEG",
-        "n02105855_15330.JPEG",
-        "n02107683_5243.JPEG",
-        "n02123159_8118.JPEG",
-        "n02124075_1953.JPEG",
-        "n02107683_3428.JPEG",
-        "n02124075_14965.JPEG",
-        "n02123597_12906.JPEG",
-        "n02123597_8698.JPEG",
-        "n02123597_27315.JPEG",
-        "n02124075_13216.JPEG",
-        "n02123394_2482.JPEG",
-        "n02124075_6734.JPEG",
-        "n02123394_8271.JPEG",
-        "n02123394_4520.JPEG",
-        "n02124075_7196.JPEG",
-        "n02123597_4513.JPEG",
-        "n02123597_2219.JPEG",
-        "n02123597_14478.JPEG",
-        "n02123597_4550.JPEG",
-        "n02105855_5964.JPEG",
-        "n02123394_6112.JPEG",
-        "n02105855_3240.JPEG",
-        "n02107683_2539.JPEG",
-        "n02108915_10337.JPEG",
-        "n02105855_2447.JPEG",
-        "n02105855_16191.JPEG",
-        "n02108915_4604.JPEG",
-        "n02105855_16951.JPEG",
-        "n02105855_18241.JPEG",
-        "n02105855_17070.JPEG",
-        "n02105855_11493.JPEG",
-        "n02107574_3775.JPEG",
-        "n02107574_282.JPEG",
-        "n02108915_6366.JPEG",
-        "n02105855_13382.JPEG",
-        "n02123597_7798.JPEG",
-        "n02107574_4950.JPEG",
-        "n02107574_351.JPEG",
-        "n02123597_5513.JPEG",
-    ]:
-        x = random.choice(folder_path)
-    return x
+def derive_pair_path(p0: Path) -> Path:
+    """
+    将 xxx_0.png -> xxx_1.png
+    只替换文件名末尾的 _0，避免污染目录名（如 _work_00000 之类）。
+    """
+    if not p0.stem.endswith("_0"):
+        raise ValueError(f"Not a *_0 file: {p0.name}")
+    stem1 = p0.stem[:-2] + "_1"  # 去掉末尾的 _0 换成 _1
+    return p0.with_name(stem1 + p0.suffix)
 
 
-def copy_image(source_folder, dest_folder, image_name):
-    dest_path = os.path.join(dest_folder, image_name.split("/")[-1])
-    shutil.copy2(image_name, dest_path)
-    return dest_path
+@torch.inference_mode()
+def caption_one_image(
+    processor: LlavaNextProcessor,
+    model: LlavaNextForConditionalGeneration,
+    device: str,
+    im: Image.Image,
+    max_new_tokens: int = 50,
+) -> str:
+    # 你原来的 prompt 保留
+    prompt = "[INST] <image>\nDescribe the image using five phrases and separate the phrases using commas.[/INST]"
+
+    # 关键修复：必须用 keyword 参数，避免把 prompt 当成 image source
+    inputs = processor(
+        text=prompt,
+        images=im,
+        return_tensors="pt",
+    )
+
+    # inputs 是 BatchEncoding：把 tensor 全部搬到 GPU
+    inputs = {k: v.to(device) for k, v in inputs.items() if torch.is_tensor(v)}
+
+    output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+    out_text = processor.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+
+    # 和你原逻辑一致：取 [/INST] 后的回答部分
+    if "[/INST]" in out_text:
+        out_text = out_text.split("[/INST]")[-1].strip()
+
+    return out_text
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--image_path', required=True, type=str, help="path to the image dir")
-    parser.add_argument(
-        '--json_path', required=True, type=str, help="path to the caption dir")
+    parser.add_argument("--image_path", required=True, type=str, help="path to the image dir")
+    parser.add_argument("--json_path", required=True, type=str, help="path to the caption output dir")
     args, extras = parser.parse_known_args()
-    
-    set_seed(42)
-    image_resolution = 768
 
-    processor = LlavaNextProcessor.from_pretrained("llava-hf/llava-v1.6-mistral-7b-hf")
+    set_seed(42)
+
+    image_resolution = 768
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    # 初始化模型
+    model_dir = "/root/autodl-tmp/FreeMorph/models/llava-v1.6-mistral-7b-hf"
+
+    processor = LlavaNextProcessor.from_pretrained(
+        model_dir,
+        local_files_only=True
+    )
 
     model = LlavaNextForConditionalGeneration.from_pretrained(
-        "llava-hf/llava-v1.6-mistral-7b-hf",
-        torch_dtype=torch.float16,
+        model_dir,
+        torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
         low_cpu_mem_usage=True,
+        local_files_only=True
     )
-    model.to("cuda")
+    model.eval()
+    model.to(device)
 
-    json_output = []
-    all_images = glob.glob(f"{args.image_path}/*")
-    for i, image_path in enumerate(tqdm(all_images)):
-        idx = image_path.split('.')[-2]
-        if idx.endswith('1'):
+    # 收集所有图片，优先只处理 *_0.(png/jpg/jpeg/webp)
+    img_dir = Path(args.image_path)
+    if not img_dir.exists():
+        raise FileNotFoundError(f"--image_path not found: {args.image_path}")
+
+    exts = {".png", ".jpg", ".jpeg", ".webp"}
+    all_files = sorted([p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in exts])
+
+    json_output: List[dict] = []
+    exp_id = 0
+
+    for p0 in tqdm(all_files, desc="caption pairs"):
+        # 只处理 *_0 文件，避免 enumerate 里混入 *_1 导致 exp_id/配对混乱
+        if not p0.stem.endswith("_0"):
             continue
-        image_path_0 = image_path
-        image_path_1 = image_path.replace('_0', '_1')
-        image_0 = Image.open(image_path_0)
-        image_1 = Image.open(image_path_1)
-        width, height = image_0.size
-        prompt = "[INST] <image>\nDescribe the image using five phrases and separate the phrases using commas.[/INST]"
-        inputs = processor(
-            prompt, load_im_from_path(image_path_0), return_tensors="pt"
-        ).to("cuda:0")
-        output = model.generate(**inputs, max_new_tokens=50)
-        prompt1 = processor.decode(output[0], skip_special_tokens=True)
-        prompt1 = prompt1.split("[/INST]")[-1].strip()
-        prompt = "[INST] <image>\nDescribe the image using five phrases and separate the phrases using commas.[/INST]"
-        inputs = processor(
-            prompt, load_im_from_path(image_path_1), return_tensors="pt"
-        ).to("cuda:0")
-        output = model.generate(**inputs, max_new_tokens=50)
-        prompt2 = processor.decode(output[0], skip_special_tokens=True)
-        prompt2 = prompt2.split("[/INST]")[-1].strip()
+
+        try:
+            p1 = derive_pair_path(p0)
+        except Exception as e:
+            print(f"[WARN] skip {p0.name}: {e}")
+            continue
+
+        if not p1.exists():
+            print(f"[WARN] missing pair image: {p1}")
+            continue
+
+        try:
+            im0 = load_im_from_path(str(p0), image_resolution=image_resolution)
+            im1 = load_im_from_path(str(p1), image_resolution=image_resolution)
+        except Exception as e:
+            print(f"[WARN] image load failed: {p0.name} / {p1.name}: {e}")
+            continue
+
+        try:
+            prompt1 = caption_one_image(processor, model, device, im0, max_new_tokens=50)
+            prompt2 = caption_one_image(processor, model, device, im1, max_new_tokens=50)
+        except Exception as e:
+            print(f"[WARN] caption model failed on {p0.name}: {e}")
+            continue
+
         json_output.append(
             {
-                "exp_id": i,
-                "image_paths": [
-                    image_path_0,
-                    image_path_1,
-                ],
+                "exp_id": exp_id,
+                "image_paths": [str(p0), str(p1)],
                 "prompts": [prompt1, prompt2],
             }
         )
+        exp_id += 1
 
     os.makedirs(args.json_path, exist_ok=True)
-    with open(f"{args.json_path}/caption.json", "w") as f:
+    out_file = os.path.join(args.json_path, "caption.json")
+
+    # 维持你原来的 jsonl 写法（每行一个 json）
+    with open(out_file, "w", encoding="utf-8") as f:
         for item in json_output:
-            f.write(json.dumps(item) + "\n")
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    print(f"[DONE] wrote {len(json_output)} items to {out_file}")
+
+
+if __name__ == "__main__":
+    main()
